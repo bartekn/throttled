@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"sync"
 	"time"
-
-	"github.com/hashicorp/golang-lru"
 )
 
 // A RateLimiter manages limiting the rate of actions by key.
@@ -127,7 +125,7 @@ type GCRARateLimiter struct {
 	// think of it as how frequently the bucket leaks one unit.
 	emissionInterval time.Duration
 
-	keys *lru.Cache
+	keys map[string]int64
 
 	sync.Mutex
 }
@@ -146,16 +144,11 @@ func NewGCRARateLimiter(maxKeys int, quota RateQuota) (*GCRARateLimiter, error) 
 		return nil, fmt.Errorf("Invalid RateQuota %#v. MaxRate must be greater than zero.", quota)
 	}
 
-	keys, err := lru.New(maxKeys)
-	if err != nil {
-		return nil, err
-	}
-
 	return &GCRARateLimiter{
 		delayVariationTolerance: quota.MaxRate.period * (time.Duration(quota.MaxBurst) + 1),
 		emissionInterval:        quota.MaxRate.period,
 		limit:                   quota.MaxBurst + 1,
-		keys:                    keys,
+		keys:                    make(map[string]int64),
 	}, nil
 }
 
@@ -175,8 +168,6 @@ func (g *GCRARateLimiter) RateLimit(key string, quantity int) (bool, RateLimitRe
 	rlc := RateLimitResult{Limit: g.limit, RetryAfter: -1}
 	limited := false
 
-	var tatVal int64
-
 	g.Lock()
 
 	// tat refers to the theoretical arrival time that would be expected
@@ -184,11 +175,9 @@ func (g *GCRARateLimiter) RateLimit(key string, quantity int) (bool, RateLimitRe
 
 	// START g.store.GetWithTime
 	now = time.Now()
-	storeVal, ok := g.keys.Get(key)
+	tatVal, ok := g.keys[key]
 	if !ok {
 		tatVal = -1
-	} else {
-		tatVal = *storeVal.(*int64)
 	}
 	// END g.store.GetWithTime
 
@@ -217,13 +206,7 @@ func (g *GCRARateLimiter) RateLimit(key string, quantity int) (bool, RateLimitRe
 
 	if !limited {
 		ttl = newTat.Sub(now)
-
-		newVal := newTat.UnixNano()
-		if tatVal == -1 {
-			g.keys.Add(key, &newVal)
-		} else {
-			*storeVal.(*int64) = newVal
-		}
+		g.keys[key] = newTat.UnixNano()
 	}
 
 	g.Unlock()
