@@ -2,6 +2,7 @@ package throttled
 
 import (
 	"fmt"
+	"hash/fnv"
 	"sync"
 	"time"
 )
@@ -125,9 +126,9 @@ type GCRARateLimiter struct {
 	// think of it as how frequently the bucket leaks one unit.
 	emissionInterval time.Duration
 
-	keys map[string]int64
+	keys map[uint8]map[string]int64
 
-	sync.Mutex
+	mutexes map[uint8]*sync.Mutex
 }
 
 // NewGCRARateLimiter creates a GCRARateLimiter. quota.Count defines
@@ -144,11 +145,19 @@ func NewGCRARateLimiter(maxKeys int, quota RateQuota) (*GCRARateLimiter, error) 
 		return nil, fmt.Errorf("Invalid RateQuota %#v. MaxRate must be greater than zero.", quota)
 	}
 
+	keys := make(map[uint8]map[string]int64)
+	mutexes := make(map[uint8]*sync.Mutex)
+	for i := 0; i <= 255; i++ {
+		keys[uint8(i)] = make(map[string]int64)
+		mutexes[uint8(i)] = new(sync.Mutex)
+	}
+
 	return &GCRARateLimiter{
 		delayVariationTolerance: quota.MaxRate.period * (time.Duration(quota.MaxBurst) + 1),
 		emissionInterval:        quota.MaxRate.period,
 		limit:                   quota.MaxBurst + 1,
-		keys:                    make(map[string]int64),
+		keys:                    keys,
+		mutexes:                 mutexes,
 	}, nil
 }
 
@@ -168,14 +177,18 @@ func (g *GCRARateLimiter) RateLimit(key string, quantity int) (bool, RateLimitRe
 	rlc := RateLimitResult{Limit: g.limit, RetryAfter: -1}
 	limited := false
 
-	g.Lock()
+	hash := fnv.New32()
+	hash.Write([]byte(key))
+	shard := uint8(hash.Sum32() % 256)
+
+	g.mutexes[shard].Lock()
 
 	// tat refers to the theoretical arrival time that would be expected
 	// from equally spaced requests at exactly the rate limit.
 
 	// START g.store.GetWithTime
 	now = time.Now()
-	tatVal, ok := g.keys[key]
+	tatVal, ok := g.keys[shard][key]
 	if !ok {
 		tatVal = -1
 	}
@@ -206,10 +219,10 @@ func (g *GCRARateLimiter) RateLimit(key string, quantity int) (bool, RateLimitRe
 
 	if !limited {
 		ttl = newTat.Sub(now)
-		g.keys[key] = newTat.UnixNano()
+		g.keys[shard][key] = newTat.UnixNano()
 	}
 
-	g.Unlock()
+	g.mutexes[shard].Unlock()
 
 	next := g.delayVariationTolerance - ttl
 	if next > -g.emissionInterval {
