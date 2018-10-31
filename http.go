@@ -5,6 +5,9 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"time"
+
+	"github.com/stellar/go/support/log"
 )
 
 var (
@@ -60,7 +63,10 @@ func (t *HTTPRateLimiter) RateLimit(h http.Handler) http.Handler {
 			k = t.VaryBy.Key(r)
 		}
 
+		logger := log.Ctx(r.Context())
+		start := time.Now()
 		limited, context, err := t.RateLimiter.RateLimit(k, 1)
+		logger.WithField("time", time.Since(start).Seconds()).Info("RateLimit finished")
 
 		if err != nil {
 			t.error(w, r, err)
